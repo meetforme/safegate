@@ -1,1079 +1,1001 @@
 import asyncio
 import hashlib
 import logging
+import math
+import os
 import random
 import re
 import sqlite3
-from collections import deque
+import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from reportlab.lib.pagesizes import A4
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
-from telegram import BotCommand, ReplyKeyboardMarkup, Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
+from telegram.constants import ChatAction, ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
+APP_NAME = "ProfShock Mega Bot"
+VERSION = "2.0"
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "safegate.db"
-LOG_PATH = BASE_DIR / "bot.log"
-REPORTS_DIR = BASE_DIR / "reports"
-REPORTS_DIR.mkdir(exist_ok=True)
+DB_PATH = BASE_DIR / "megabot.db"
+LOG_PATH = BASE_DIR / "megabot.log"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()],
 )
-logger = logging.getLogger("safegate-ultra")
+logger = logging.getLogger(APP_NAME)
 
-MAIN_MENU = ReplyKeyboardMarkup(
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["ℹ️ Информация", "👤 Профиль"],
-        ["🛡 Советы по ИБ", "🔎 Проверить ввод"],
-        ["🎭 Симуляция атаки", "📈 Мой риск"],
-        ["🛰 IDS статус", "🧾 Мои нарушения"],
-        ["📜 Команды", "⚙️ Админ-панель"],
+        [KeyboardButton("ℹ️ Инфо"), KeyboardButton("🛡 ИБ-режим")],
+        [KeyboardButton("🔐 Генератор пароля"), KeyboardButton("🧮 Калькулятор")],
+        [KeyboardButton("📝 Заметки"), KeyboardButton("✅ ToDo")],
+        [KeyboardButton("🎲 Развлечения"), KeyboardButton("⏰ Напоминание")],
+        [KeyboardButton("📊 Дашборд"), KeyboardButton("👑 Админ")],
     ],
     resize_keyboard=True,
 )
 
-CHECK_PROMPT = "Отправь текст одним сообщением, и я проверю его на базовые признаки риска."
-VERIFY_PROMPT = "Отправь секретный код одним сообщением."
-ADMIN_LOGIN_TTL_MINUTES = 10
-SPAM_LIMIT = 6
-SPAM_WINDOW_SECONDS = 10
-MAX_VERIFY_FAILS = 3
-MAX_SUSPICIOUS_EVENTS = 3
-BLOCK_MINUTES = 5
-
-ATTACK_SCENARIOS = {
-    "sql": "SELECT * FROM users WHERE id = 1 OR 1=1;",
-    "xss": "<script>alert('xss')</script>",
-    "bruteforce": "Многократный подбор секретного кода.",
-    "spam": "Частая отправка сообщений за короткий интервал.",
-    "admin": "Попытка обращения к административным функциям без прав.",
+ATTACK_PATTERNS = {
+    "sql": r"('|--|;|drop\s+table|union\s+select)",
+    "xss": r"(<script|javascript:|onerror=|onload=)",
+    "path": r"(\.\./|\\\.\\|/etc/passwd|system32)",
+    "cmd": r"(rm\s+-rf|del\s+/f|shutdown|powershell|cmd\.exe)",
 }
-HONEYPOT_COMMANDS = {"root", "token", "database", "admin_full"}
 
+JOKES = [
+    "ИБ-шник не спит — он проводит ночной мониторинг.",
+    "Лучший пароль — тот, который помнишь только ты и менеджер паролей.",
+    "Когда преподаватель спросил про threat model, бот уже построил три.",
+    "У хорошего бота две любви: логирование и минимизация привилегий.",
+]
+
+QUOTES = [
+    "Безопасность — это процесс, а не продукт.",
+    "Самая дорогая уязвимость — та, которую считали маловероятной.",
+    "Лишние данные — лишний риск.",
+    "Простая защита, внедрённая вовремя, лучше идеальной защиты, внедрённой никогда.",
+]
+
+QUIZ = [
+    ("Что безопаснее хранить в открытом виде?", ["Пароль", "Токен", "Ничего из этого", "Секретный ключ"], 2),
+    ("Какая атака связана с перегрузкой запросами?", ["XSS", "Flood", "Phishing", "MITM"], 1),
+    ("Что делает 2FA?", ["Шифрует БД", "Добавляет второй фактор", "Сжимает трафик", "Удаляет логи"], 1),
+]
 
 @dataclass
 class Config:
     bot_token: str
     admin_id: Optional[int]
-    secret_code: str
+    secret_code_hash: str
+    admin_pin: str
 
 
 def load_config() -> Config:
     env_path = BASE_DIR / ".env"
-    if not env_path.exists():
-        raise RuntimeError(f"Файл .env не найден. Ожидался по пути: {env_path}")
+    if env_path.exists():
+        load_dotenv(env_path, override=True)
 
-    data = {}
-    for line in env_path.read_text(encoding="utf-8-sig").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        data[key.strip()] = value.strip().strip('"').strip("'")
-
-    bot_token = data.get("BOT_TOKEN", "").strip()
-    admin_id_raw = data.get("ADMIN_ID", "").strip()
-    secret_code = data.get("SECRET_CODE", "safegate").strip()
-
+    bot_token = os.getenv("BOT_TOKEN", "").strip()
     if not bot_token:
-        raise RuntimeError(f"Не найден BOT_TOKEN. Проверен файл: {env_path}")
+        raise RuntimeError(f"Не найден BOT_TOKEN. Проверь файл: {env_path}")
 
-    try:
-        admin_id = int(admin_id_raw) if admin_id_raw else None
-    except ValueError as exc:
-        raise RuntimeError("ADMIN_ID должен быть числом.") from exc
+    admin_id_raw = os.getenv("ADMIN_ID", "").strip()
+    admin_id = int(admin_id_raw) if admin_id_raw.isdigit() else None
+    secret_code = os.getenv("SECRET_CODE", "safegate").strip()
+    admin_pin = os.getenv("ADMIN_PIN", "123456").strip()
+    return Config(
+        bot_token=bot_token,
+        admin_id=admin_id,
+        secret_code_hash=hashlib.sha256(secret_code.encode("utf-8")).hexdigest(),
+        admin_pin=admin_pin,
+    )
 
-    return Config(bot_token=bot_token, admin_id=admin_id, secret_code=secret_code)
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db() -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     cur = conn.cursor()
-    cur.execute(
+    cur.executescript(
         """
         CREATE TABLE IF NOT EXISTS users (
-            telegram_id INTEGER PRIMARY KEY,
+            user_id INTEGER PRIMARY KEY,
             username TEXT,
             full_name TEXT,
-            registered_at TEXT
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS events (
+            joined_at TEXT,
+            suspicious_count INTEGER DEFAULT 0,
+            flood_count INTEGER DEFAULT 0,
+            brute_force_count INTEGER DEFAULT 0,
+            messages_count INTEGER DEFAULT 0,
+            admin_verified INTEGER DEFAULT 0,
+            blocked_until REAL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER,
+            user_id INTEGER,
             event_type TEXT,
             severity TEXT,
             details TEXT,
             created_at TEXT
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS incidents (
+        );
+
+        CREATE TABLE IF NOT EXISTS notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER,
-            incident_type TEXT,
-            severity TEXT,
-            status TEXT,
-            details TEXT,
-            actions_taken TEXT,
+            user_id INTEGER,
+            content TEXT,
             created_at TEXT
-        )
+        );
+
+        CREATE TABLE IF NOT EXISTS todos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            content TEXT,
+            is_done INTEGER DEFAULT 0,
+            created_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            remind_at TEXT,
+            content TEXT,
+            created_at TEXT
+        );
         """
     )
     conn.commit()
     conn.close()
 
 
-def register_user(update: Update) -> None:
-    user = update.effective_user
-    if not user:
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ensure_user(user) -> None:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO users(user_id, username, full_name, joined_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            full_name=excluded.full_name
+        """,
+        (user.id, user.username or "", user.full_name, now_str()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def log_event(user_id: Optional[int], event_type: str, severity: str, details: str) -> None:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO logs(user_id, event_type, severity, details, created_at) VALUES (?, ?, ?, ?, ?)",
+        (user_id, event_type, severity, details[:1500], now_str()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def incr_user_counter(user_id: int, field: str, value: int = 1) -> None:
+    allowed = {"suspicious_count", "flood_count", "brute_force_count", "messages_count"}
+    if field not in allowed:
         return
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE users SET {field} = COALESCE({field},0) + ? WHERE user_id = ?", (value, user_id))
+    conn.commit()
+    conn.close()
+
+
+def set_admin_verified(user_id: int, verified: bool) -> None:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET admin_verified=? WHERE user_id=?", (1 if verified else 0, user_id))
+    conn.commit()
+    conn.close()
+
+
+def is_admin_verified(user_id: int) -> bool:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT admin_verified FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row and row[0])
+
+
+def set_block(user_id: int, seconds: int) -> None:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET blocked_until=? WHERE user_id=?", (time.time() + seconds, user_id))
+    conn.commit()
+    conn.close()
+
+
+def get_block_remaining(user_id: int) -> int:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT blocked_until FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return 0
+    remaining = int((row[0] or 0) - time.time())
+    return max(0, remaining)
+
+
+def user_stats(user_id: int) -> Optional[sqlite3.Row]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def overall_stats() -> sqlite3.Row:
+    conn = db()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT OR REPLACE INTO users (telegram_id, username, full_name, registered_at)
-        VALUES (?, ?, ?, COALESCE((SELECT registered_at FROM users WHERE telegram_id=?), ?))
+        SELECT
+          (SELECT COUNT(*) FROM users) AS users_total,
+          (SELECT COUNT(*) FROM logs) AS logs_total,
+          (SELECT COUNT(*) FROM logs WHERE severity IN ('medium','high','critical')) AS incidents_total,
+          (SELECT COUNT(*) FROM users WHERE blocked_until > ?) AS blocked_now,
+          (SELECT COUNT(*) FROM notes) AS notes_total,
+          (SELECT COUNT(*) FROM todos) AS todos_total
         """,
-        (
-            user.id,
-            user.username or "",
-            f"{user.first_name or ''} {user.last_name or ''}".strip(),
-            user.id,
-            datetime.now().isoformat(timespec="seconds"),
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-
-def log_event(telegram_id: Optional[int], event_type: str, details: str = "", severity: str = "info") -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO events (telegram_id, event_type, severity, details, created_at) VALUES (?, ?, ?, ?, ?)",
-        (telegram_id, event_type, severity, details[:1500], datetime.now().isoformat(timespec="seconds")),
-    )
-    conn.commit()
-    conn.close()
-
-
-def create_incident(
-    telegram_id: Optional[int],
-    incident_type: str,
-    severity: str,
-    details: str,
-    actions_taken: str,
-    status: str = "open",
-) -> int:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO incidents (telegram_id, incident_type, severity, status, details, actions_taken, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            telegram_id,
-            incident_type,
-            severity,
-            status,
-            details[:1500],
-            actions_taken[:1500],
-            datetime.now().isoformat(timespec="seconds"),
-        ),
-    )
-    incident_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return incident_id
-
-
-def get_last_incident() -> Optional[tuple]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, telegram_id, incident_type, severity, status, details, actions_taken, created_at FROM incidents ORDER BY id DESC LIMIT 1"
+        (time.time(),),
     )
     row = cur.fetchone()
     conn.close()
     return row
 
 
-def get_incident_by_id(incident_id: int) -> Optional[tuple]:
-    conn = sqlite3.connect(DB_PATH)
+def latest_logs(limit: int = 10, severe_only: bool = False) -> list[sqlite3.Row]:
+    conn = db()
     cur = conn.cursor()
-    cur.execute(
-        "SELECT id, telegram_id, incident_type, severity, status, details, actions_taken, created_at FROM incidents WHERE id = ?",
-        (incident_id,),
-    )
-    row = cur.fetchone()
+    if severe_only:
+        cur.execute(
+            "SELECT * FROM logs WHERE severity IN ('medium','high','critical') ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+    else:
+        cur.execute("SELECT * FROM logs ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cur.fetchall()
     conn.close()
-    return row
+    return rows
 
 
-def is_admin(user_id: Optional[int], config: Config) -> bool:
-    return user_id is not None and config.admin_id is not None and user_id == config.admin_id
+def latest_incident() -> Optional[sqlite3.Row]:
+    rows = latest_logs(limit=1, severe_only=True)
+    return rows[0] if rows else None
 
 
-def hash_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def compute_risk(row: sqlite3.Row) -> tuple[str, int]:
+    score = (row["suspicious_count"] * 15) + (row["flood_count"] * 10) + (row["brute_force_count"] * 20)
+    if score >= 90:
+        return "Критический", score
+    if score >= 60:
+        return "Высокий", score
+    if score >= 25:
+        return "Повышенный", score
+    return "Нормальный", score
 
 
-def analyze_text(text: str) -> list[str]:
-    findings = []
-    if len(text) > 300:
-        findings.append("слишком длинный ввод")
-    if re.search(r"(<script|</script>|select\s+\*|drop\s+table|union\s+select|or\s+1=1|insert\s+into|delete\s+from)", text, flags=re.I):
-        findings.append("похоже на инъекцию или опасную конструкцию")
-    if re.search(r"[<>]{2,}|[\"'`;]{3,}", text):
-        findings.append("подозрительные спецсимволы")
-    if re.search(r"(token|password|passwd|secret|api[_-]?key|private key)", text, flags=re.I):
-        findings.append("возможная чувствительная информация")
-    if re.search(r"https?://", text, flags=re.I):
-        findings.append("содержит ссылку")
-    return findings
+def classify_text(text: str) -> list[str]:
+    hits = []
+    if len(text) > 500:
+        hits.append("Слишком длинный ввод")
+    for attack_type, pattern in ATTACK_PATTERNS.items():
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            hits.append(f"Паттерн {attack_type.upper()}")
+    if re.search(r"https?://", text, re.IGNORECASE):
+        hits.append("Содержит ссылку")
+    return hits
 
 
-def get_user_stats(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict:
-    stats = context.application.user_data[user_id]
-    stats.setdefault("verify_failures", 0)
-    stats.setdefault("suspicious_count", 0)
-    stats.setdefault("spam_warns", 0)
-    stats.setdefault("message_times", deque(maxlen=12))
-    stats.setdefault("awaiting", None)
-    stats.setdefault("blocked_until", None)
-    stats.setdefault("risk_score", 0)
-    stats.setdefault("otp_code", None)
-    stats.setdefault("otp_expiry", None)
-    stats.setdefault("admin_session_until", None)
-    stats.setdefault("last_incident_id", None)
-    return stats
+def parse_duration(spec: str) -> Optional[int]:
+    m = re.fullmatch(r"(\d+)([smhd])", spec.lower().strip())
+    if not m:
+        return None
+    value = int(m.group(1))
+    unit = m.group(2)
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    return value * multipliers[unit]
 
 
-def remaining_block_text(blocked_until_iso: str) -> str:
-    blocked_until = datetime.fromisoformat(blocked_until_iso)
-    left = max(0, int((blocked_until - datetime.now()).total_seconds()))
-    minutes = left // 60
-    seconds = left % 60
-    return f"{minutes} мин {seconds} сек" if minutes else f"{seconds} сек"
-
-
-def is_user_blocked(stats: dict) -> bool:
-    blocked_until_iso = stats.get("blocked_until")
-    if not blocked_until_iso:
-        return False
-    blocked_until = datetime.fromisoformat(blocked_until_iso)
-    if datetime.now() >= blocked_until:
-        stats["blocked_until"] = None
-        stats["verify_failures"] = 0
-        stats["suspicious_count"] = 0
-        return False
-    return True
-
-
-def block_user(stats: dict) -> None:
-    stats["blocked_until"] = (datetime.now() + timedelta(minutes=BLOCK_MINUTES)).isoformat(timespec="seconds")
-
-
-def add_risk(stats: dict, value: int) -> None:
-    stats["risk_score"] = max(0, stats.get("risk_score", 0) + value)
-
-
-def get_risk_level(stats: dict) -> tuple[str, str]:
-    score = stats.get("risk_score", 0)
-    if score >= 16:
-        return "критический", "🔴"
-    if score >= 10:
-        return "высокий", "🟠"
-    if score >= 5:
-        return "повышенный", "🟡"
-    return "нормальный", "🟢"
-
-
-def admin_session_active(stats: dict) -> bool:
-    until = stats.get("admin_session_until")
-    if not until:
-        return False
-    expiry = datetime.fromisoformat(until)
-    if datetime.now() >= expiry:
-        stats["admin_session_until"] = None
-        return False
-    return True
-
-
-async def notify_admin(app: Application, config: Config, message: str) -> None:
-    if config.admin_id:
+async def admin_notify(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    admin_id = context.application.bot_data.get("config").admin_id
+    if admin_id:
         try:
-            await app.bot.send_message(chat_id=config.admin_id, text=message)
+            await context.bot.send_message(admin_id, text)
         except Exception as exc:
-            logger.warning("Не удалось отправить уведомление админу: %s", exc)
+            logger.warning("Admin notify failed: %s", exc)
 
 
-async def send_menu(update: Update, text: str) -> None:
-    await update.message.reply_text(text, reply_markup=MAIN_MENU, parse_mode=ParseMode.HTML)
-
-
-async def show_help(update: Update) -> None:
-    text = (
-        "<b>Команды и подсказки</b>\n\n"
-        "/start — запуск бота и показ меню\n"
-        "/help — список команд\n"
-        "/menu — открыть меню\n"
-        "/info — описание проекта\n"
-        "/security — рекомендации по ИБ\n"
-        "/profile — профиль и статус пользователя\n"
-        "/check текст — анализ введённого текста\n"
-        "/verify код — проверка секретного кода\n"
-        "/violations — личная статистика нарушений\n"
-        "/risk — оценка уровня риска\n"
-        "/ids — статус встроенной IDS\n"
-        "/simulate [sql|xss|bruteforce|spam|admin] — симуляция атаки\n"
-        "/admin — вход в админ-панель через PIN\n"
-        "/admin_login PIN — подтверждение входа администратора\n"
-        "/dashboard — центр мониторинга безопасности\n"
-        "/logs — последние события\n"
-        "/incident [id|latest] — отчёт по инциденту\n"
-        "/report — PDF-отчёт по безопасности\n\n"
-        "Honeypot-команды: /root, /token, /database, /admin_full"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
+async def post_init(app: Application) -> None:
+    commands = [
+        BotCommand("start", "Запуск и регистрация"),
+        BotCommand("help", "Список возможностей"),
+        BotCommand("menu", "Показать кнопочное меню"),
+        BotCommand("info", "О проекте"),
+        BotCommand("security", "Рекомендации по ИБ"),
+        BotCommand("check", "Проверить ввод на риски"),
+        BotCommand("verify", "Проверить секретный код"),
+        BotCommand("password", "Сгенерировать пароль"),
+        BotCommand("calc", "Безопасный калькулятор"),
+        BotCommand("hash", "Получить SHA-256"),
+        BotCommand("note", "Добавить заметку"),
+        BotCommand("notes", "Список заметок"),
+        BotCommand("todo", "Управление задачами"),
+        BotCommand("remind", "Поставить напоминание"),
+        BotCommand("quiz", "Мини-викторина"),
+        BotCommand("fun", "Игровое меню"),
+        BotCommand("risk", "Риск-профиль пользователя"),
+        BotCommand("ids", "Статус IDS"),
+        BotCommand("simulate", "Симуляция атаки"),
+        BotCommand("dashboard", "Панель мониторинга"),
+        BotCommand("admin", "Запросить админ-доступ"),
+        BotCommand("admin_login", "Войти как админ по PIN"),
+        BotCommand("logs", "Показать журнал событий"),
+        BotCommand("incident", "Отчёт по инциденту"),
+        BotCommand("report", "PDF-отчёт"),
+    ]
+    await app.bot.set_my_commands(commands)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    register_user(update)
-    user_id = update.effective_user.id if update.effective_user else None
-    log_event(user_id, "start", "Запуск бота")
+    user = update.effective_user
+    ensure_user(user)
+    log_event(user.id, "start", "low", "Запуск бота")
     text = (
-        "🛡 <b>SafeGate Ultra Bot</b>\n\n"
-        "Демонстрационный Telegram-бот по защите информации.\n"
-        "Он показывает контроль доступа, журналирование, IDS, honeypot-команды,\n"
-        "риск-скоринг, симуляции атак и формирование отчётов по инцидентам.\n\n"
-        "Открой /help или используй меню ниже."
+        f"🔥 <b>{APP_NAME}</b> v{VERSION}\n\n"
+        "Это демонстрационный Telegram-бот для курсовой/практики, который совмещает ИБ-механику, утилиты, развлечения, журналирование и вау-эффекты для защиты проекта.\n\n"
+        "Нажми /menu или используй кнопки ниже."
     )
-    await send_menu(update, text)
+    await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD, parse_mode=ParseMode.HTML)
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "<b>Главные команды</b>\n"
+        "/menu — клавиатура\n"
+        "/info — описание проекта\n"
+        "/security — ИБ-памятка\n"
+        "/check текст — анализ ввода\n"
+        "/verify код — проверка кода\n"
+        "/password 18 — генерация пароля\n"
+        "/calc 2*(5+7) — калькулятор\n"
+        "/hash текст — SHA-256\n"
+        "/note текст — добавить заметку\n"
+        "/notes — список заметок\n"
+        "/todo add текст | /todo list | /todo done 2\n"
+        "/remind 10m текст — напоминание\n"
+        "/quiz — мини-викторина\n"
+        "/fun — развлечения\n"
+        "/risk — риск-профиль\n"
+        "/ids — IDS-статистика\n"
+        "/simulate sql|xss|spam|bruteforce|admin — демонстрация атаки\n"
+        "/dashboard — мониторинг\n"
+        "/admin и /admin_login 123456 — админ-доступ\n"
+        "/logs, /incident latest, /report — отчёты\n\n"
+        "Honeypot-команды: /root /token /database /admin_full"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log_event(update.effective_user.id if update.effective_user else None, "menu", "Открыто меню")
-    await send_menu(update, "Главное меню открыто.")
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await show_help(update)
+    await update.message.reply_text("Меню активировано.", reply_markup=MAIN_KEYBOARD)
 
 
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "<b>О боте</b>\n\n"
-        "SafeGate Ultra Bot — учебный прототип защищённого Telegram-бота с функциями обнаружения,\n"
-        "регистрации и анализа инцидентов информационной безопасности."
+        "<b>О боте</b>\n"
+        "Бот объединяет учебный стенд по информационной безопасности, интерактивную админ-панель, демонстрации атак, анализ рисков, напоминания, заметки, задачи, развлечения и генерацию PDF-отчётов.\n\n"
+        "То есть это уже не просто бот, а мини-платформа для демонстрации практических механизмов ИБ."
     )
-    log_event(update.effective_user.id if update.effective_user else None, "info", "Просмотр описания")
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def security(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "<b>Рекомендации по защите Telegram-ботов</b>\n\n"
-        "• хранить токен вне исходного кода;\n"
-        "• ограничивать права по Telegram ID и доп. подтверждению;\n"
-        "• валидировать пользовательский ввод;\n"
-        "• журналировать критические события;\n"
-        "• отслеживать brute force и flood;\n"
-        "• применять honeypot и мониторинг инцидентов;\n"
-        "• формировать отчётность по безопасности."
+        "🛡 <b>Памятка по ИБ</b>\n"
+        "• не храни токены в открытом коде\n"
+        "• используй .env и минимальные привилегии\n"
+        "• валидируй пользовательский ввод\n"
+        "• логируй подозрительные действия\n"
+        "• ограничивай brute force и flood\n"
+        "• делай резервные копии и отчёты\n"
+        "• применяй 2FA для админ-функций\n"
     )
-    log_event(update.effective_user.id if update.effective_user else None, "security", "Просмотр рекомендаций")
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    register_user(update)
-    stats = get_user_stats(context, user.id)
-    blocked = "нет"
-    if stats.get("blocked_until") and is_user_blocked(stats):
-        blocked = remaining_block_text(stats["blocked_until"])
-    risk_level, emoji = get_risk_level(stats)
+    row = user_stats(update.effective_user.id)
+    if not row:
+        await update.message.reply_text("Профиль пока не найден. Нажми /start.")
+        return
+    risk, score = compute_risk(row)
     text = (
-        "<b>Профиль пользователя</b>\n\n"
-        f"ID: <code>{user.id}</code>\n"
-        f"Username: @{user.username if user.username else 'не указан'}\n"
-        f"Имя: {user.full_name}\n"
-        f"Риск-профиль: {emoji} {risk_level}\n"
-        f"Ошибок проверки кода: {stats['verify_failures']}\n"
-        f"Подозрительных действий: {stats['suspicious_count']}\n"
-        f"Блокировка: {blocked}"
+        f"<b>Профиль</b>\nID: <code>{row['user_id']}</code>\n"
+        f"Имя: {row['full_name']}\n"
+        f"Username: @{row['username'] or 'нет'}\n"
+        f"Сообщений: {row['messages_count']}\n"
+        f"Подозрительных событий: {row['suspicious_count']}\n"
+        f"Риск: <b>{risk}</b> ({score})"
     )
-    log_event(user.id, "profile", "Просмотр профиля")
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
-
-
-async def violations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    stats = get_user_stats(context, user.id)
-    blocked_text = "активной блокировки нет"
-    if stats.get("blocked_until") and is_user_blocked(stats):
-        blocked_text = f"блокировка ещё на {remaining_block_text(stats['blocked_until'])}"
-    text = (
-        "<b>Статистика безопасности</b>\n\n"
-        f"Неудачных проверок кода: {stats['verify_failures']}\n"
-        f"Подозрительных вводов: {stats['suspicious_count']}\n"
-        f"Предупреждений за спам: {stats['spam_warns']}\n"
-        f"Статус: {blocked_text}"
-    )
-    log_event(user.id, "violations", "Просмотр статистики нарушений")
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
-
-
-async def risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    stats = get_user_stats(context, user.id)
-    reasons = []
-    if stats["verify_failures"]:
-        reasons.append(f"неверные проверки кода: {stats['verify_failures']}")
-    if stats["suspicious_count"]:
-        reasons.append(f"подозрительные вводы: {stats['suspicious_count']}")
-    if stats["spam_warns"]:
-        reasons.append(f"антиспам-предупреждения: {stats['spam_warns']}")
-    risk_level, emoji = get_risk_level(stats)
-    text = (
-        f"<b>Оценка риска пользователя</b>\n\nТекущий уровень: {emoji} <b>{risk_level}</b>\n"
-        f"Risk score: <code>{stats['risk_score']}</code>\n"
-        f"Причины: {'; '.join(reasons) if reasons else 'негативные факторы не обнаружены'}"
-    )
-    log_event(user.id, "risk_view", f"risk_score={stats['risk_score']}")
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
-
-
-async def ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT severity, COUNT(*) FROM incidents GROUP BY severity")
-    rows = dict(cur.fetchall())
-    cur.execute("SELECT COUNT(*) FROM incidents")
-    total = cur.fetchone()[0]
-    conn.close()
-    text = (
-        "<b>Статус встроенной IDS</b>\n\n"
-        "Система обнаружения активна.\n"
-        f"Всего инцидентов: {total}\n"
-        f"Критических: {rows.get('critical', 0)}\n"
-        f"Высоких: {rows.get('high', 0)}\n"
-        f"Средних: {rows.get('medium', 0)}\n"
-        f"Низких: {rows.get('low', 0)}"
-    )
-    log_event(update.effective_user.id if update.effective_user else None, "ids_view", "Просмотр IDS статуса")
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    stats = get_user_stats(context, user.id)
-    if is_user_blocked(stats):
-        await update.message.reply_text(
-            f"⛔ Временная блокировка активна ещё {remaining_block_text(stats['blocked_until'])}.",
-            reply_markup=MAIN_MENU,
-        )
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("Используй так: /check <текст>")
         return
-
-    if context.args:
-        await process_check(update, context, " ".join(context.args))
-        return
-
-    stats["awaiting"] = "check"
-    await update.message.reply_text(CHECK_PROMPT, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
-
-
-async def process_check(update: Update, context: ContextTypes.DEFAULT_TYPE, text_to_check: str) -> None:
-    user = update.effective_user
-    stats = get_user_stats(context, user.id)
-    findings = analyze_text(text_to_check)
-    stats["awaiting"] = None
-
-    if findings:
-        stats["suspicious_count"] += 1
-        add_risk(stats, 3)
-        details = "; ".join(findings)
-        incident_id = create_incident(
-            user.id,
-            "suspicious_input",
-            "medium",
-            f"Текст: {text_to_check[:300]} | Признаки: {details}",
-            "Ввод отклонён, событие записано, администратор уведомлён.",
-        )
-        stats["last_incident_id"] = incident_id
-        response = "<b>Результат анализа</b>\n\nОбнаружено:\n- " + "\n- ".join(findings)
-        log_event(user.id, "suspicious_input", details, "medium")
-        await notify_admin(
-            context.application,
-            context.bot_data["config"],
-            f"⚠️ Инцидент #{incident_id}: подозрительный ввод от {user.id}",
-        )
-        if stats["suspicious_count"] >= MAX_SUSPICIOUS_EVENTS:
-            block_user(stats)
-            add_risk(stats, 4)
-            response += f"\n\n⛔ Из-за повторяющихся подозрительных действий доступ ограничен на {BLOCK_MINUTES} минут."
-            log_event(user.id, "user_blocked", "Блокировка за подозрительные вводы", "high")
+    hits = classify_text(text)
+    if hits:
+        incr_user_counter(update.effective_user.id, "suspicious_count", 1)
+        log_event(update.effective_user.id, "input_check", "medium", f"Подозрительный ввод: {', '.join(hits)}")
+        await admin_notify(context, f"🚨 Подозрительный ввод от {update.effective_user.id}: {', '.join(hits)}")
+        await update.message.reply_text("⚠️ Обнаружены риски:\n- " + "\n- ".join(hits))
     else:
-        response = "<b>Результат анализа</b>\n\nПодозрительных признаков не обнаружено."
-        log_event(user.id, "check_ok", "Проверка текста без замечаний")
-
-    await update.message.reply_text(response, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
+        log_event(update.effective_user.id, "input_check", "low", "Ввод чистый")
+        await update.message.reply_text("✅ Явных рисков не обнаружено.")
 
 
 async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    stats = get_user_stats(context, user.id)
-    if is_user_blocked(stats):
-        await update.message.reply_text(
-            f"⛔ Временная блокировка активна ещё {remaining_block_text(stats['blocked_until'])}.",
-            reply_markup=MAIN_MENU,
-        )
+    code = " ".join(context.args).strip()
+    if not code:
+        await update.message.reply_text("Используй: /verify <код>")
         return
-
-    if context.args:
-        await process_verify(update, context, " ".join(context.args).strip())
-        return
-
-    stats["awaiting"] = "verify"
-    await update.message.reply_text(VERIFY_PROMPT, reply_markup=MAIN_MENU)
-
-
-async def process_verify(update: Update, context: ContextTypes.DEFAULT_TYPE, entered: str) -> None:
-    user = update.effective_user
-    stats = get_user_stats(context, user.id)
-    config: Config = context.bot_data["config"]
-    stats["awaiting"] = None
-    ok = hash_text(entered) == hash_text(config.secret_code)
-
-    if ok:
-        stats["verify_failures"] = 0
-        add_risk(stats, -2)
-        log_event(user.id, "verify_success", "Успешная проверка кода")
-        await update.message.reply_text("✅ Код подтверждён.", reply_markup=MAIN_MENU)
+    hashed = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    config = context.application.bot_data["config"]
+    if hashed == config.secret_code_hash:
+        log_event(update.effective_user.id, "verify", "low", "Успешная проверка кода")
+        await update.message.reply_text("✅ Код подтверждён.")
     else:
-        stats["verify_failures"] += 1
-        add_risk(stats, 2)
-        log_event(user.id, "verify_failed", "Неуспешная проверка кода", "medium")
-        response = f"❌ Код неверный. Попытка {stats['verify_failures']} из {MAX_VERIFY_FAILS}."
-        if stats["verify_failures"] >= MAX_VERIFY_FAILS:
-            block_user(stats)
-            add_risk(stats, 5)
-            incident_id = create_incident(
-                user.id,
-                "bruteforce_detected",
-                "high",
-                f"Пользователь превысил лимит ошибок проверки кода: {stats['verify_failures']}",
-                f"Пользователь заблокирован на {BLOCK_MINUTES} минут, администратор уведомлён.",
-            )
-            stats["last_incident_id"] = incident_id
-            log_event(user.id, "user_blocked", "Блокировка за многократные ошибки verify", "high")
-            await notify_admin(
-                context.application,
-                config,
-                f"⛔ Инцидент #{incident_id}: пользователь {user.id} заблокирован после ошибок проверки кода.",
-            )
-            response += f"\n⛔ Доступ ограничен на {BLOCK_MINUTES} минут."
-        await update.message.reply_text(response, reply_markup=MAIN_MENU)
+        incr_user_counter(update.effective_user.id, "brute_force_count", 1)
+        log_event(update.effective_user.id, "verify", "high", "Неверный секретный код")
+        set_block(update.effective_user.id, 30)
+        await admin_notify(context, f"🚨 Попытка подбора кода: {update.effective_user.id}")
+        await update.message.reply_text("❌ Код неверный. Проверка временно заблокирована на 30 секунд.")
+
+
+async def password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    length = 16
+    if context.args and context.args[0].isdigit():
+        length = max(8, min(64, int(context.args[0])))
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+"
+    pwd = "".join(random.choice(alphabet) for _ in range(length))
+    await update.message.reply_text(f"🔐 Новый пароль:\n<code>{pwd}</code>", parse_mode=ParseMode.HTML)
+
+
+async def calc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    expr = " ".join(context.args).strip()
+    if not expr:
+        await update.message.reply_text("Используй: /calc 2*(5+7)")
+        return
+    if not re.fullmatch(r"[\d\s\+\-\*\/\(\)\.,%]+", expr):
+        await update.message.reply_text("Разрешены только цифры, скобки и арифметические операторы.")
+        return
+    try:
+        expr = expr.replace(",", ".")
+        result = eval(expr, {"__builtins__": {}}, {"abs": abs, "round": round, "math": math})
+        await update.message.reply_text(f"🧮 Результат: <code>{result}</code>", parse_mode=ParseMode.HTML)
+    except Exception:
+        await update.message.reply_text("Не удалось вычислить выражение.")
+
+
+async def hash_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("Используй: /hash <текст>")
+        return
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    await update.message.reply_text(f"SHA-256:\n<code>{digest}</code>", parse_mode=ParseMode.HTML)
+
+
+async def note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    content = " ".join(context.args).strip()
+    if not content:
+        await update.message.reply_text("Используй: /note <текст заметки>")
+        return
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO notes(user_id, content, created_at) VALUES (?, ?, ?)", (update.effective_user.id, content, now_str()))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("📝 Заметка сохранена.")
+
+
+async def notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, content, created_at FROM notes WHERE user_id=? ORDER BY id DESC LIMIT 10", (update.effective_user.id,))
+    rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("Заметок пока нет.")
+        return
+    text = "<b>Последние заметки</b>\n" + "\n".join([f"{r['id']}. {r['content']} <i>({r['created_at']})</i>" for r in rows])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Используй: /todo add <текст> | /todo list | /todo done <id>")
+        return
+    action = context.args[0].lower()
+    conn = db()
+    cur = conn.cursor()
+    if action == "add":
+        content = " ".join(context.args[1:]).strip()
+        if not content:
+            await update.message.reply_text("После add нужен текст задачи.")
+        else:
+            cur.execute("INSERT INTO todos(user_id, content, created_at) VALUES (?, ?, ?)", (update.effective_user.id, content, now_str()))
+            conn.commit()
+            await update.message.reply_text("✅ Задача добавлена.")
+    elif action == "list":
+        cur.execute("SELECT id, content, is_done FROM todos WHERE user_id=? ORDER BY id DESC LIMIT 15", (update.effective_user.id,))
+        rows = cur.fetchall()
+        if not rows:
+            await update.message.reply_text("Список задач пуст.")
+        else:
+            text = "<b>ToDo</b>\n" + "\n".join([f"{'✅' if r['is_done'] else '▫️'} {r['id']}. {r['content']}" for r in rows])
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    elif action == "done" and len(context.args) > 1 and context.args[1].isdigit():
+        cur.execute("UPDATE todos SET is_done=1 WHERE id=? AND user_id=?", (int(context.args[1]), update.effective_user.id))
+        conn.commit()
+        await update.message.reply_text("Готово. Задача отмечена выполненной.")
+    else:
+        await update.message.reply_text("Не понял команду todo.")
+    conn.close()
+
+
+async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) < 2:
+        await update.message.reply_text("Используй: /remind 10m купить кофе")
+        return
+    seconds = parse_duration(context.args[0])
+    if not seconds:
+        await update.message.reply_text("Формат времени: 30s, 10m, 2h, 1d")
+        return
+    content = " ".join(context.args[1:]).strip()
+    remind_at = datetime.now() + timedelta(seconds=seconds)
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO reminders(user_id, remind_at, content, created_at) VALUES (?, ?, ?, ?)",
+        (update.effective_user.id, remind_at.strftime("%Y-%m-%d %H:%M:%S"), content, now_str()),
+    )
+    reminder_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    context.job_queue.run_once(reminder_job, when=seconds, data={"chat_id": update.effective_chat.id, "content": content, "user_id": update.effective_user.id, "reminder_id": reminder_id})
+    await update.message.reply_text(f"⏰ Напоминание поставлено на {context.args[0]}.")
+
+
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data
+    await context.bot.send_message(data["chat_id"], f"⏰ Напоминание: {data['content']}")
+    log_event(data["user_id"], "reminder", "low", f"Сработало напоминание #{data['reminder_id']}")
+
+
+async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    idx = random.randrange(len(QUIZ))
+    q, options, correct = QUIZ[idx]
+    context.user_data["quiz_answer"] = correct
+    keyboard = [[InlineKeyboardButton(opt, callback_data=f"quiz:{i}")] for i, opt in enumerate(options)]
+    await update.message.reply_text(f"❓ <b>{q}</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+
+
+async def fun(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🎲 Бросить кубик", callback_data="fun:dice"), InlineKeyboardButton("🪙 Монетка", callback_data="fun:coin")],
+            [InlineKeyboardButton("😂 Шутка", callback_data="fun:joke"), InlineKeyboardButton("💬 Цитата", callback_data="fun:quote")],
+            [InlineKeyboardButton("🎯 Случайный факт", callback_data="fun:fact"), InlineKeyboardButton("🔥 Вау-режим", callback_data="fun:wow")],
+        ]
+    )
+    await update.message.reply_text("Выбери приколюшку:", reply_markup=keyboard)
+
+
+async def risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    row = user_stats(update.effective_user.id)
+    if not row:
+        await update.message.reply_text("Профиль не найден.")
+        return
+    risk_level, score = compute_risk(row)
+    reasons = []
+    if row["suspicious_count"]:
+        reasons.append(f"подозрительных событий: {row['suspicious_count']}")
+    if row["flood_count"]:
+        reasons.append(f"флуд-триггеров: {row['flood_count']}")
+    if row["brute_force_count"]:
+        reasons.append(f"ошибок кода: {row['brute_force_count']}")
+    reason_text = "\n".join([f"- {x}" for x in reasons]) if reasons else "- серьёзных инцидентов не замечено"
+    await update.message.reply_text(f"<b>Риск-профиль</b>\nУровень: <b>{risk_level}</b>\nScore: <code>{score}</code>\nПричины:\n{reason_text}", parse_mode=ParseMode.HTML)
+
+
+async def ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    rows = latest_logs(limit=200)
+    crit = sum(1 for r in rows if r["severity"] == "critical")
+    high = sum(1 for r in rows if r["severity"] == "high")
+    med = sum(1 for r in rows if r["severity"] == "medium")
+    low = sum(1 for r in rows if r["severity"] == "low")
+    text = (
+        "<b>IDS-статус</b>\n"
+        "Система обнаружения вторжений: активна\n"
+        f"Критических: {crit}\nВысоких: {high}\nСредних: {med}\nНизких: {low}\n"
+        f"Всего просмотрено последних событий: {len(rows)}"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def simulate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    stats = get_user_stats(context, user.id)
-    scenario = (context.args[0].lower() if context.args else "").strip()
-
-    if not scenario:
-        available = ", ".join(ATTACK_SCENARIOS.keys())
-        await update.message.reply_text(
-            f"Выбери сценарий: /simulate sql, /simulate xss, /simulate bruteforce, /simulate spam, /simulate admin\nДоступно: {available}",
-            reply_markup=MAIN_MENU,
-        )
+    attack = (context.args[0].lower() if context.args else "").strip()
+    if attack not in {"sql", "xss", "spam", "bruteforce", "admin"}:
+        await update.message.reply_text("Используй: /simulate sql|xss|spam|bruteforce|admin")
         return
-    if scenario not in ATTACK_SCENARIOS:
-        await update.message.reply_text("Неизвестный сценарий. Используй /simulate sql|xss|bruteforce|spam|admin", reply_markup=MAIN_MENU)
-        return
-
-    severity = "medium"
-    actions = "Событие смоделировано, зафиксировано и отображено в учебном режиме."
-    details = ATTACK_SCENARIOS[scenario]
-    add_risk(stats, 1)
-
-    if scenario in {"bruteforce", "admin"}:
-        severity = "high"
-    if scenario == "spam":
-        severity = "low"
-
-    incident_id = create_incident(user.id, f"simulation_{scenario}", severity, details, actions, status="simulated")
-    stats["last_incident_id"] = incident_id
-    log_event(user.id, "attack_simulation", f"scenario={scenario}", severity)
-
-    response = (
-        f"<b>Симуляция атаки: {scenario}</b>\n\n"
-        f"Полезная нагрузка: <code>{details}</code>\n"
-        f"Реакция системы: обнаружение, журналирование, классификация по критичности, формирование инцидента #{incident_id}.\n"
-        f"Критичность: {severity}."
-    )
-    await update.message.reply_text(response, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
-
-
-def ensure_admin_session(user_id: Optional[int], context: ContextTypes.DEFAULT_TYPE) -> tuple[bool, str]:
-    config: Config = context.bot_data["config"]
-    if not is_admin(user_id, config):
-        return False, "Доступ запрещён."
-    stats = get_user_stats(context, user_id)
-    if not admin_session_active(stats):
-        return False, "Сессия администратора не подтверждена. Используй /admin и затем /admin_login PIN."
-    return True, ""
-
-
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    config: Config = context.bot_data["config"]
-    user_id = update.effective_user.id if update.effective_user else None
-    if not is_admin(user_id, config):
-        incident_id = create_incident(
-            user_id,
-            "admin_access_denied",
-            "high",
-            "Попытка доступа к административной панели без прав.",
-            "Доступ отклонён, администратор уведомлён.",
-        )
-        log_event(user_id, "admin_denied", "Попытка доступа к панели администратора", "high")
-        await notify_admin(context.application, config, f"🚫 Инцидент #{incident_id}: попытка доступа к /admin от {user_id}")
-        await update.message.reply_text("Доступ запрещён.", reply_markup=MAIN_MENU)
-        return
-
-    stats = get_user_stats(context, user_id)
-    otp = f"{random.randint(100000, 999999)}"
-    stats["otp_code"] = otp
-    stats["otp_expiry"] = (datetime.now() + timedelta(minutes=3)).isoformat(timespec="seconds")
-    log_event(user_id, "admin_otp_generated", "Сгенерирован PIN для входа в админ-панель")
+    severity = "high" if attack in {"bruteforce", "admin"} else "medium"
+    description = {
+        "sql": "UNION SELECT ... DROP TABLE users;",
+        "xss": "<script>alert('xss')</script>",
+        "spam": "100 сообщений за 5 секунд",
+        "bruteforce": "подбор секретного кода",
+        "admin": "попытка эскалации привилегий",
+    }[attack]
+    incr_user_counter(update.effective_user.id, "suspicious_count", 1)
+    if attack == "spam":
+        incr_user_counter(update.effective_user.id, "flood_count", 1)
+    if attack == "bruteforce":
+        incr_user_counter(update.effective_user.id, "brute_force_count", 1)
+        set_block(update.effective_user.id, 60)
+    log_event(update.effective_user.id, f"simulate_{attack}", severity, description)
+    await admin_notify(context, f"🚨 Симуляция {attack.upper()} от {update.effective_user.id}")
     await update.message.reply_text(
-        f"🔐 Для входа в админ-панель используй команду <code>/admin_login {otp}</code> в течение 3 минут.",
+        f"⚠️ Симуляция атаки <b>{attack.upper()}</b>\n"
+        f"Полезная нагрузка: <code>{description}</code>\n"
+        "Результат: угроза распознана, событие залогировано, администратор уведомлён.",
         parse_mode=ParseMode.HTML,
-        reply_markup=MAIN_MENU,
-    )
-
-
-async def admin_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    config: Config = context.bot_data["config"]
-    user_id = update.effective_user.id if update.effective_user else None
-    if not is_admin(user_id, config):
-        await update.message.reply_text("Доступ запрещён.", reply_markup=MAIN_MENU)
-        return
-    if not context.args:
-        await update.message.reply_text("Используй: /admin_login 123456", reply_markup=MAIN_MENU)
-        return
-
-    stats = get_user_stats(context, user_id)
-    otp = stats.get("otp_code")
-    expiry = stats.get("otp_expiry")
-    if not otp or not expiry:
-        await update.message.reply_text("Сначала вызови /admin для получения PIN.", reply_markup=MAIN_MENU)
-        return
-    if datetime.now() >= datetime.fromisoformat(expiry):
-        stats["otp_code"] = None
-        stats["otp_expiry"] = None
-        await update.message.reply_text("PIN истёк. Запроси новый через /admin.", reply_markup=MAIN_MENU)
-        return
-    if context.args[0].strip() != otp:
-        log_event(user_id, "admin_login_failed", "Неверный PIN администратора", "high")
-        await update.message.reply_text("Неверный PIN.", reply_markup=MAIN_MENU)
-        return
-
-    stats["otp_code"] = None
-    stats["otp_expiry"] = None
-    stats["admin_session_until"] = (datetime.now() + timedelta(minutes=ADMIN_LOGIN_TTL_MINUTES)).isoformat(timespec="seconds")
-    log_event(user_id, "admin_login_success", "Вход администратора подтверждён")
-    await update.message.reply_text(
-        "✅ Административная сессия активна на 10 минут. Доступны /dashboard, /logs, /incident, /report.",
-        reply_markup=MAIN_MENU,
     )
 
 
 async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id if update.effective_user else None
-    ok, message = ensure_admin_session(user_id, context)
-    if not ok:
-        await update.message.reply_text(message, reply_markup=MAIN_MENU)
-        return
-
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    users_count = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM events")
-    events_count = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM incidents")
-    incidents_count = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM incidents WHERE severity = 'critical'")
-    critical_count = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM incidents WHERE status IN ('open', 'simulated')")
-    active_incidents = cur.fetchone()[0]
-    cur.execute("SELECT incident_type, COUNT(*) AS c FROM incidents GROUP BY incident_type ORDER BY c DESC LIMIT 3")
-    top_incidents = cur.fetchall()
-    conn.close()
-
-    top_text = "\n".join([f"• {name}: {count}" for name, count in top_incidents]) if top_incidents else "нет данных"
+    stats = overall_stats()
+    incident = latest_incident()
+    latest = f"{incident['event_type']} / {incident['created_at']}" if incident else "нет"
     text = (
-        "<b>Панель мониторинга безопасности</b>\n\n"
-        f"Пользователей: {users_count}\n"
-        f"Событий в журнале: {events_count}\n"
-        f"Инцидентов: {incidents_count}\n"
-        f"Критических: {critical_count}\n"
-        f"Активных/симулированных: {active_incidents}\n\n"
-        f"Топ инцидентов:\n{top_text}"
+        "<b>ПАНЕЛЬ МОНИТОРИНГА</b>\n"
+        f"Пользователей: {stats['users_total']}\n"
+        f"Логов: {stats['logs_total']}\n"
+        f"Инцидентов: {stats['incidents_total']}\n"
+        f"Активных блокировок: {stats['blocked_now']}\n"
+        f"Заметок: {stats['notes_total']}\n"
+        f"ToDo: {stats['todos_total']}\n"
+        f"Последний инцидент: {latest}"
     )
-    log_event(user_id, "dashboard_open", "Открыт центр мониторинга")
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id if update.effective_user else None
-    ok, message = ensure_admin_session(user_id, context)
-    if not ok:
-        await update.message.reply_text(message, reply_markup=MAIN_MENU)
+def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    config = context.application.bot_data["config"]
+    uid = update.effective_user.id
+    return bool(config.admin_id == uid and is_admin_verified(uid))
+
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config = context.application.bot_data["config"]
+    if update.effective_user.id != config.admin_id:
+        log_event(update.effective_user.id, "admin_access", "high", "Попытка доступа к панели администратора")
+        await update.message.reply_text("⛔ Ты не являешься зарегистрированным администратором.")
         return
+    await update.message.reply_text("👑 Для входа введи: /admin_login <PIN>")
 
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT created_at, telegram_id, event_type, severity, details FROM events ORDER BY id DESC LIMIT 15")
-    rows = cur.fetchall()
-    conn.close()
 
+async def admin_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config = context.application.bot_data["config"]
+    if update.effective_user.id != config.admin_id:
+        await update.message.reply_text("Нет доступа.")
+        return
+    pin = " ".join(context.args).strip()
+    if pin == config.admin_pin:
+        set_admin_verified(update.effective_user.id, True)
+        log_event(update.effective_user.id, "admin_login", "medium", "Успешный вход администратора")
+        await update.message.reply_text("✅ Админ-доступ активирован на текущую сессию.")
+    else:
+        log_event(update.effective_user.id, "admin_login", "high", "Неверный PIN администратора")
+        await update.message.reply_text("❌ Неверный PIN.")
+
+
+async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not require_admin(update, context):
+        await update.message.reply_text("Сначала выполни /admin и /admin_login <PIN>.")
+        return
+    rows = latest_logs(limit=15)
     if not rows:
-        await update.message.reply_text("Журнал пока пуст.", reply_markup=MAIN_MENU)
+        await update.message.reply_text("Журнал пуст.")
         return
-
-    lines = ["<b>Последние события</b>"]
-    for created_at, telegram_id, event_type, severity, details in rows:
-        lines.append(f"\n<code>{created_at}</code>\nuser={telegram_id} | {event_type} | {severity}\n{details[:120]}")
-    log_event(user_id, "logs_open", "Просмотр журнала")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
+    text = "<b>Последние события</b>\n" + "\n\n".join([
+        f"#{r['id']} [{r['severity']}] {r['event_type']}\nUID: {r['user_id']}\n{r['details']}\n{r['created_at']}" for r in rows
+    ])
+    await update.message.reply_text(text[:4000], parse_mode=ParseMode.HTML)
 
 
 async def incident(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id if update.effective_user else None
-    ok, message = ensure_admin_session(user_id, context)
-    if not ok:
-        await update.message.reply_text(message, reply_markup=MAIN_MENU)
+    if not require_admin(update, context):
+        await update.message.reply_text("Сначала выполни /admin_login <PIN>.")
         return
-
-    if context.args and context.args[0].lower() != "latest":
-        try:
-            incident_id = int(context.args[0])
-        except ValueError:
-            await update.message.reply_text("Используй /incident latest или /incident 12", reply_markup=MAIN_MENU)
-            return
-        row = get_incident_by_id(incident_id)
-    else:
-        row = get_last_incident()
-
+    row = latest_incident()
     if not row:
-        await update.message.reply_text("Инциденты пока не зарегистрированы.", reply_markup=MAIN_MENU)
+        await update.message.reply_text("Инцидентов пока нет.")
         return
-
-    inc_id, tg_id, inc_type, severity, status, details, actions_taken, created_at = row
     text = (
-        "<b>Отчёт об инциденте</b>\n\n"
-        f"ID: {inc_id}\n"
-        f"Пользователь: {tg_id}\n"
-        f"Дата: {created_at}\n"
-        f"Тип: {inc_type}\n"
-        f"Критичность: {severity}\n"
-        f"Статус: {status}\n"
-        f"Описание: {details}\n"
-        f"Принятые меры: {actions_taken}"
+        "<b>ОТЧЁТ ОБ ИНЦИДЕНТЕ</b>\n"
+        f"ID события: {row['id']}\n"
+        f"Пользователь: {row['user_id']}\n"
+        f"Тип: {row['event_type']}\n"
+        f"Критичность: {row['severity']}\n"
+        f"Описание: {row['details']}\n"
+        f"Дата: {row['created_at']}\n"
+        "Принятые меры: логирование, уведомление администратора, ограничение доступа при необходимости."
     )
-    log_event(user_id, "incident_view", f"incident_id={inc_id}")
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-def _register_font() -> str:
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-        "C:/Windows/Fonts/arial.ttf",
+def build_pdf_report() -> str:
+    fd, path = tempfile.mkstemp(prefix="megabot_report_", suffix=".pdf")
+    os.close(fd)
+    c = canvas.Canvas(path, pagesize=A4)
+    w, h = A4
+    y = h - 50
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, y, f"{APP_NAME}: отчёт по безопасности")
+    y -= 30
+    c.setFont("Helvetica", 11)
+    c.drawString(50, y, f"Дата формирования: {now_str()}")
+    y -= 30
+    stats = overall_stats()
+    lines = [
+        f"Пользователей: {stats['users_total']}",
+        f"Логов: {stats['logs_total']}",
+        f"Инцидентов: {stats['incidents_total']}",
+        f"Активных блокировок: {stats['blocked_now']}",
+        "",
+        "Последние инциденты:",
     ]
-    for font_path in candidates:
-        if Path(font_path).exists():
-            pdfmetrics.registerFont(TTFont("SafeGateFont", font_path))
-            return "SafeGateFont"
-    return "Helvetica"
-
-
-def create_pdf_report() -> Path:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    users_count = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM events")
-    events_count = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM incidents")
-    incidents_count = cur.fetchone()[0]
-    cur.execute("SELECT severity, COUNT(*) FROM incidents GROUP BY severity")
-    by_severity = dict(cur.fetchall())
-    cur.execute("SELECT incident_type, COUNT(*) AS c FROM incidents GROUP BY incident_type ORDER BY c DESC LIMIT 10")
-    top_incidents = cur.fetchall()
-    cur.execute("SELECT created_at, telegram_id, incident_type, severity FROM incidents ORDER BY id DESC LIMIT 10")
-    latest = cur.fetchall()
-    conn.close()
-
-    report_path = REPORTS_DIR / f"safegate_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-    font_name = _register_font()
-    c = canvas.Canvas(str(report_path), pagesize=A4)
-    width, height = A4
-    x, y = 40, height - 50
-
-    def line(text: str, step: int = 16):
-        nonlocal y
+    for row in latest_logs(limit=10, severe_only=True):
+        lines.append(f"- [{row['severity']}] {row['event_type']} | UID {row['user_id']} | {row['created_at']}")
+    for line in lines:
         if y < 60:
             c.showPage()
-            c.setFont(font_name, 11)
-            y = height - 50
-        c.drawString(x, y, text[:110])
-        y -= step
-
-    c.setFont(font_name, 14)
-    line("SafeGate Ultra Bot — отчет по безопасности", 22)
-    c.setFont(font_name, 11)
-    line(f"Дата формирования: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
-    line(f"Пользователей: {users_count}")
-    line(f"Событий: {events_count}")
-    line(f"Инцидентов: {incidents_count}")
-    line(f"Critical: {by_severity.get('critical', 0)} | High: {by_severity.get('high', 0)} | Medium: {by_severity.get('medium', 0)} | Low: {by_severity.get('low', 0)}", 22)
-    line("Топ инцидентов:")
-    for inc_type, count in top_incidents or [("нет данных", 0)]:
-        line(f"- {inc_type}: {count}")
-    line("", 8)
-    line("Последние инциденты:")
-    for created_at, tg_id, inc_type, severity in latest or [("-", "-", "нет данных", "-")]:
-        line(f"- {created_at} | user={tg_id} | {inc_type} | {severity}")
-    line("", 8)
-    line("Рекомендации:")
-    for item in [
-        "Регулярно перевыпускать токен после его раскрытия.",
-        "Ограничивать админ-доступ по Telegram ID и PIN-подтверждению.",
-        "Контролировать подозрительный ввод и brute force.",
-        "Периодически анализировать журнал событий и отчеты.",
-    ]:
-        line(f"- {item}")
+            y = h - 50
+            c.setFont("Helvetica", 11)
+        c.drawString(50, y, line[:110])
+        y -= 18
     c.save()
-    return report_path
+    return path
 
 
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id if update.effective_user else None
-    ok, message = ensure_admin_session(user_id, context)
-    if not ok:
-        await update.message.reply_text(message, reply_markup=MAIN_MENU)
+    if not require_admin(update, context):
+        await update.message.reply_text("Сначала выполни /admin_login <PIN>.")
         return
-
-    path = create_pdf_report()
-    log_event(user_id, "report_generated", path.name)
-    await update.message.reply_document(document=path.open("rb"), filename=path.name, caption="PDF-отчёт по безопасности готов.")
-
-
-async def check_rate_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user = update.effective_user
-    if not user:
-        return False
-    stats = get_user_stats(context, user.id)
-    if is_user_blocked(stats):
-        await update.message.reply_text(
-            f"⛔ Временная блокировка активна ещё {remaining_block_text(stats['blocked_until'])}.",
-            reply_markup=MAIN_MENU,
-        )
-        return True
-
-    now = datetime.now().timestamp()
-    message_times: deque = stats["message_times"]
-    message_times.append(now)
-    recent = [t for t in message_times if now - t <= SPAM_WINDOW_SECONDS]
-    if len(recent) > SPAM_LIMIT:
-        stats["spam_warns"] += 1
-        add_risk(stats, 3)
-        log_event(user.id, "spam_detected", f"Более {SPAM_LIMIT} сообщений за {SPAM_WINDOW_SECONDS} сек", "medium")
-        if stats["spam_warns"] >= 2:
-            block_user(stats)
-            incident_id = create_incident(
-                user.id,
-                "spam_detected",
-                "high",
-                f"Зафиксирован флуд: более {SPAM_LIMIT} сообщений за {SPAM_WINDOW_SECONDS} секунд.",
-                f"Пользователь заблокирован на {BLOCK_MINUTES} минут, администратор уведомлён.",
-            )
-            stats["last_incident_id"] = incident_id
-            await notify_admin(
-                context.application,
-                context.bot_data["config"],
-                f"⛔ Инцидент #{incident_id}: пользователь {user.id} заблокирован из-за спама.",
-            )
-            await update.message.reply_text(
-                f"⛔ Слишком много запросов. Доступ ограничен на {BLOCK_MINUTES} минут.",
-                reply_markup=MAIN_MENU,
-            )
-        else:
-            await update.message.reply_text(
-                "⚠️ Слишком много сообщений подряд. Уменьши частоту запросов.",
-                reply_markup=MAIN_MENU,
-            )
-        return True
-    return False
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not update.message:
-        return
-
-    register_user(update)
-    if await check_rate_limit(update, context):
-        return
-
-    stats = get_user_stats(context, user.id)
-    text = (update.message.text or "").strip()
-
-    button_map = {
-        "ℹ️ Информация": info,
-        "👤 Профиль": profile,
-        "🛡 Советы по ИБ": security,
-        "🔎 Проверить ввод": check,
-        "🎭 Симуляция атаки": simulate,
-        "📈 Мой риск": risk,
-        "🛰 IDS статус": ids,
-        "🧾 Мои нарушения": violations,
-        "📜 Команды": help_command,
-        "⚙️ Админ-панель": admin,
-    }
-    if text in button_map:
-        await button_map[text](update, context)
-        return
-
-    awaiting = stats.get("awaiting")
-    if awaiting == "check":
-        await process_check(update, context, text)
-        return
-    if awaiting == "verify":
-        await process_verify(update, context, text)
-        return
-
-    log_event(user.id, "free_text", text[:150])
-    await update.message.reply_text(
-        "Я не понял запрос. Используй меню или /help. Для демонстрации атак доступна команда /simulate.",
-        reply_markup=MAIN_MENU,
-    )
+    await update.message.reply_chat_action(ChatAction.UPLOAD_DOCUMENT)
+    pdf_path = build_pdf_report()
+    with open(pdf_path, "rb") as f:
+        await update.message.reply_document(f, filename="megabot_security_report.pdf", caption="PDF-отчёт готов.")
+    try:
+        os.remove(pdf_path)
+    except OSError:
+        pass
 
 
 async def honeypot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id if update.effective_user else None
-    command = update.message.text.split()[0].lstrip("/") if update.message and update.message.text else "unknown"
-    incident_id = create_incident(
-        user_id,
-        f"honeypot_{command}",
-        "critical",
-        f"Активирована honeypot-команда /{command}.",
-        "Событие классифицировано как разведка/попытка эскалации привилегий. Администратор уведомлён.",
-    )
-    log_event(user_id, "honeypot_triggered", f"/{command}", "critical")
-    if update.effective_user:
-        add_risk(get_user_stats(context, update.effective_user.id), 6)
-    await notify_admin(context.application, context.bot_data["config"], f"🚨 Критический инцидент #{incident_id}: активирована honeypot-команда /{command} пользователем {user_id}")
+    cmd = update.message.text.split()[0]
+    incr_user_counter(update.effective_user.id, "suspicious_count", 1)
+    log_event(update.effective_user.id, "honeypot", "critical", f"Использована honeypot-команда {cmd}")
+    set_block(update.effective_user.id, 120)
+    await admin_notify(context, f"🚨 HONEYPOT: {update.effective_user.id} вызвал {cmd}")
+    await update.message.reply_text("🚨 Команда зарегистрирована системой deception security. Событие передано в IDS.")
+
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    ensure_user(user)
+    incr_user_counter(user.id, "messages_count", 1)
+
+    remaining = get_block_remaining(user.id)
+    if remaining > 0:
+        await update.message.reply_text(f"⛔ Временная блокировка. Осталось {remaining} сек.")
+        return
+
+    now = time.time()
+    timestamps = context.user_data.setdefault("msg_times", [])
+    timestamps.append(now)
+    timestamps[:] = [t for t in timestamps if now - t < 5]
+    if len(timestamps) > 6:
+        incr_user_counter(user.id, "flood_count", 1)
+        set_block(user.id, 20)
+        log_event(user.id, "flood", "high", "Сработал антиспам")
+        await admin_notify(context, f"🚨 Flood от {user.id}")
+        await update.message.reply_text("🚫 Слишком много сообщений. Антиспам активирован на 20 секунд.")
+        return
+
+    text = (update.message.text or "").strip()
+    btn = text.lower()
+
+    mapping = {
+        "ℹ️ инфо": info,
+        "🛡 иб-режим": security,
+        "🔐 генератор пароля": password,
+        "🧮 калькулятор": calc,
+        "📝 заметки": notes,
+        "✅ todo": todo,
+        "🎲 развлечения": fun,
+        "⏰ напоминание": remind,
+        "📊 дашборд": dashboard,
+        "👑 админ": admin,
+    }
+    if btn in mapping:
+        if btn in {"🔐 генератор пароля", "🧮 калькулятор", "⏰ напоминание".lower(), "✅ todo".lower()}:
+            prompts = {
+                "🔐 генератор пароля": "Используй: /password 18",
+                "🧮 калькулятор": "Используй: /calc 2*(5+7)",
+                "✅ todo": "Используй: /todo add купить кофе",
+                "⏰ напоминание": "Используй: /remind 10m сделать доклад",
+            }
+            await update.message.reply_text(prompts[btn])
+            return
+        await mapping[btn](update, context)
+        return
+
+    hits = classify_text(text)
+    if hits:
+        incr_user_counter(user.id, "suspicious_count", 1)
+        severity = "critical" if any("CMD" in h or "PATH" in h for h in hits) else "medium"
+        log_event(user.id, "free_text_alert", severity, f"Текстовое сообщение вызвало IDS: {', '.join(hits)} | {text[:250]}")
+        await admin_notify(context, f"🚨 IDS сработала на сообщение {user.id}: {', '.join(hits)}")
+        await update.message.reply_text("⚠️ IDS заметила риск в сообщении. Событие занесено в журнал.")
+        return
+
+    if "препод" in text.lower() or "защита" in text.lower():
+        await update.message.reply_text("🔥 На защите просто покажи /dashboard, /ids, /simulate sql, /incident latest и /report — эффект гарантирован.")
+        return
+
     await update.message.reply_text(
-        "🚨 Действие классифицировано как попытка несанкционированного доступа. Событие записано.",
-        reply_markup=MAIN_MENU,
+        "Я готов к командам. Попробуй /help, /fun, /quiz, /password 20, /simulate xss или /dashboard",
+        reply_markup=MAIN_KEYBOARD,
     )
+
+
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("quiz:"):
+        selected = int(data.split(":", 1)[1])
+        correct = context.user_data.get("quiz_answer")
+        if selected == correct:
+            await query.edit_message_text("✅ Верно. Ты знаешь базу по ИБ.")
+        else:
+            await query.edit_message_text("❌ Неверно. Но теперь это тоже часть обучения.")
+        return
+
+    if data == "fun:dice":
+        await query.edit_message_text(f"🎲 Выпало число: {random.randint(1,6)}")
+    elif data == "fun:coin":
+        await query.edit_message_text(f"🪙 {'Орёл' if random.choice([True, False]) else 'Решка'}")
+    elif data == "fun:joke":
+        await query.edit_message_text(f"😂 {random.choice(JOKES)}")
+    elif data == "fun:quote":
+        await query.edit_message_text(f"💬 {random.choice(QUOTES)}")
+    elif data == "fun:fact":
+        facts = [
+            "Telegram-боты не видят сообщения до запуска их процесса.",
+            "Один утёкший токен может полностью скомпрометировать бота.",
+            "Журналирование без ротации и контроля доступа само становится риском.",
+        ]
+        await query.edit_message_text(f"🎯 {random.choice(facts)}")
+    elif data == "fun:wow":
+        await query.edit_message_text("🔥 Режим активирован: представь, что это уже не бот, а демонстрационный SOC в Telegram.")
 
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id if update.effective_user else None
-    log_event(user_id, "unknown_command", update.message.text if update.message else "", "low")
-    await update.message.reply_text("Неизвестная команда. Используй /help", reply_markup=MAIN_MENU)
+    await update.message.reply_text("Неизвестная команда. Открой /help")
 
 
-async def post_init(app: Application) -> None:
-    bot = await app.bot.get_me()
-    await app.bot.set_my_commands(
-        [
-            BotCommand("start", "Запустить бота и открыть меню"),
-            BotCommand("help", "Список команд"),
-            BotCommand("menu", "Открыть кнопочное меню"),
-            BotCommand("info", "Информация о проекте"),
-            BotCommand("security", "Советы по защите информации"),
-            BotCommand("profile", "Мой профиль и статус"),
-            BotCommand("check", "Проверить ввод на риски"),
-            BotCommand("verify", "Проверить секретный код"),
-            BotCommand("violations", "Мои нарушения"),
-            BotCommand("risk", "Оценить уровень риска"),
-            BotCommand("ids", "Статус встроенной IDS"),
-            BotCommand("simulate", "Запустить симуляцию атаки"),
-            BotCommand("admin", "Запросить PIN администратора"),
-            BotCommand("admin_login", "Подтвердить вход администратора"),
-            BotCommand("dashboard", "Центр мониторинга безопасности"),
-            BotCommand("logs", "Просмотреть журнал событий"),
-            BotCommand("incident", "Отчёт по инциденту"),
-            BotCommand("report", "Сгенерировать PDF-отчёт"),
-        ]
-    )
-    logger.info("Бот запущен: @%s", bot.username)
+def build_app() -> Application:
+    config = load_config()
+    init_db()
+    app = Application.builder().token(config.bot_token).post_init(post_init).build()
+    app.bot_data["config"] = config
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("info", info))
+    app.add_handler(CommandHandler("security", security))
+    app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("check", check))
+    app.add_handler(CommandHandler("verify", verify))
+    app.add_handler(CommandHandler("password", password))
+    app.add_handler(CommandHandler("calc", calc))
+    app.add_handler(CommandHandler("hash", hash_cmd))
+    app.add_handler(CommandHandler("note", note))
+    app.add_handler(CommandHandler("notes", notes))
+    app.add_handler(CommandHandler("todo", todo))
+    app.add_handler(CommandHandler("remind", remind))
+    app.add_handler(CommandHandler("quiz", quiz))
+    app.add_handler(CommandHandler("fun", fun))
+    app.add_handler(CommandHandler("risk", risk))
+    app.add_handler(CommandHandler("ids", ids))
+    app.add_handler(CommandHandler("simulate", simulate))
+    app.add_handler(CommandHandler("dashboard", dashboard))
+    app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CommandHandler("admin_login", admin_login))
+    app.add_handler(CommandHandler("logs", logs_cmd))
+    app.add_handler(CommandHandler("incident", incident))
+    app.add_handler(CommandHandler("report", report))
+
+    for cmd in ["root", "token", "database", "admin_full"]:
+        app.add_handler(CommandHandler(cmd, honeypot))
+
+    app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown))
+    return app
 
 
 async def main() -> None:
-    config = load_config()
-    init_db()
-
-    application = Application.builder().token(config.bot_token).post_init(post_init).build()
-    application.bot_data["config"] = config
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("menu", menu))
-    application.add_handler(CommandHandler("info", info))
-    application.add_handler(CommandHandler("security", security))
-    application.add_handler(CommandHandler("profile", profile))
-    application.add_handler(CommandHandler("check", check))
-    application.add_handler(CommandHandler("verify", verify))
-    application.add_handler(CommandHandler("violations", violations))
-    application.add_handler(CommandHandler("risk", risk))
-    application.add_handler(CommandHandler("ids", ids))
-    application.add_handler(CommandHandler("simulate", simulate))
-    application.add_handler(CommandHandler("admin", admin))
-    application.add_handler(CommandHandler("admin_login", admin_login))
-    application.add_handler(CommandHandler("dashboard", dashboard))
-    application.add_handler(CommandHandler("logs", logs))
-    application.add_handler(CommandHandler("incident", incident))
-    application.add_handler(CommandHandler("report", report))
-    for hp in HONEYPOT_COMMANDS:
-        application.add_handler(CommandHandler(hp, honeypot))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    application.add_handler(MessageHandler(filters.COMMAND, unknown))
-
-    logger.info("Запуск polling...")
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
+    app = build_app()
+    logger.info("%s started", APP_NAME)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
     try:
-        await asyncio.Event().wait()
+        while True:
+            await asyncio.sleep(3600)
     finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
 
 if __name__ == "__main__":
